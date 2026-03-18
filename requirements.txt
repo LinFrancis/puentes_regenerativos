@@ -1,0 +1,258 @@
+"""
+Excel export utility for admin database download.
+Generates a multi-sheet XLSX with all database tables,
+including computed indices and denormalized action/dimension labels.
+"""
+import io
+from datetime import datetime
+
+
+def export_database_to_excel(db, lang="es"):
+    """
+    Export all database tables to an Excel workbook (BytesIO).
+    Returns (bytes_io, filename).
+    """
+    import pandas as pd
+    from utils.i18n import get_dimensions, get_axes, get_actor_types, get_connection_types
+    from utils.index_calculator import calculate_all_indices
+
+    profiles = db.get_profiles()
+    connections = db.get_connections()
+    impact_locs = db.get_impact_locations()
+    messages = db.get_messages(parent_id=None)
+
+    # Compute indices
+    indices = calculate_all_indices(profiles, connections, impact_locs)
+
+    # Lookup maps
+    dims_map = {d["id"]: d["name"] for d in get_dimensions(lang)}
+    actor_map = get_actor_types(lang)
+    conn_type_map = get_connection_types(lang)
+    action_map = {}
+    axis_map = {}
+    for ax in get_axes(lang):
+        axis_map[ax["id"]] = ax["name"]
+        for a in ax["actions"]:
+            action_map[a["id"]] = f"{ax['name']} → {a['name']}"
+
+    profile_name_map = {p["id"]: p["nombre"] for p in profiles}
+
+    # ── Sheet 1: PROFILES ──
+    profiles_rows = []
+    for p in profiles:
+        dim_labels = [dims_map.get(d, d) for d in p.get("dimensiones_regeneracion", [])]
+        action_labels = [action_map.get(a, a) for a in p.get("acciones", [])]
+        # Count connections for this profile
+        n_conns = len([c for c in connections
+                       if c["source_profile_id"] == p["id"] or c["target_profile_id"] == p["id"]])
+
+        profiles_rows.append({
+            "ID": p.get("id", ""),
+            "Nombre": p.get("nombre", ""),
+            "Tipo Actor": actor_map.get(p.get("tipo_actor", ""), p.get("tipo_actor", "")),
+            "Descripción": p.get("descripcion", ""),
+            "Email": p.get("email", ""),
+            "Teléfono": p.get("telefono", ""),
+            "Web": p.get("web", ""),
+            "País": p.get("pais", ""),
+            "Región": p.get("region", ""),
+            "Ciudad": p.get("ciudad", ""),
+            "Comuna": p.get("comuna", ""),
+            "Dirección": p.get("direccion_exacta", ""),
+            "Latitud": p.get("lat", ""),
+            "Longitud": p.get("lon", ""),
+            "Usa Centroide": "Sí" if p.get("usa_centroid") else "No",
+            "Dimensiones Regeneración": " | ".join(dim_labels),
+            "Acciones": " | ".join(action_labels),
+            "Nº Acciones": len(p.get("acciones", [])),
+            "Interpretación Regeneración": p.get("interpretacion_regeneracion", ""),
+            "Redes Participa": " | ".join(p.get("redes_participa", [])),
+            "Año Ingreso Red": p.get("ano_ingreso_red", ""),
+            "Año Inicio Regeneración": p.get("ano_inicio_regeneracion", ""),
+            "Personas Impactadas": p.get("personas_impactadas", ""),
+            "Hectáreas Regeneradas": p.get("hectareas_regeneradas", ""),
+            "Nº Conexiones": n_conns,
+            "Índice Puentes (0-100)": indices.get(p["id"], 0),
+            "Es Nodo Fantasma": "Sí" if p.get("es_fantasma") else "No",
+            "Fecha Creación": p.get("fecha_creacion", ""),
+            "Fecha Actualización": p.get("fecha_actualizacion", ""),
+        })
+
+    df_profiles = pd.DataFrame(profiles_rows)
+
+    # ── Sheet 2: CONNECTIONS ──
+    conn_rows = []
+    for c in connections:
+        conn_rows.append({
+            "ID": c.get("id", ""),
+            "Origen (ID)": c.get("source_profile_id", ""),
+            "Origen (Nombre)": profile_name_map.get(c.get("source_profile_id", ""), "?"),
+            "Destino (ID)": c.get("target_profile_id", ""),
+            "Destino (Nombre)": profile_name_map.get(c.get("target_profile_id", ""), "?"),
+            "Tipo Relación": conn_type_map.get(c.get("tipo_relacion", ""), c.get("tipo_relacion", "")),
+            "Intensidad (1-5)": c.get("intensidad", ""),
+            "Es Externa": "Sí" if c.get("es_externa") else "No",
+            "Fecha Creación": c.get("fecha_creacion", ""),
+        })
+
+    df_connections = pd.DataFrame(conn_rows)
+
+    # ── Sheet 3: IMPACT LOCATIONS ──
+    impact_rows = []
+    for il in impact_locs:
+        impact_rows.append({
+            "ID": il.get("id", ""),
+            "Perfil (ID)": il.get("profile_id", ""),
+            "Perfil (Nombre)": profile_name_map.get(il.get("profile_id", ""), "?"),
+            "País": il.get("pais", ""),
+            "Región": il.get("region", ""),
+            "Ciudad": il.get("ciudad", ""),
+            "Latitud": il.get("lat", ""),
+            "Longitud": il.get("lon", ""),
+        })
+
+    df_impact = pd.DataFrame(impact_rows)
+
+    # ── Sheet 4: MESSAGES (forum) ──
+    all_messages = _collect_all_messages(db)
+    msg_rows = []
+    for m in all_messages:
+        msg_rows.append({
+            "ID": m.get("id", ""),
+            "Autor": m.get("autor_nombre", ""),
+            "Contenido": m.get("contenido", ""),
+            "Parent ID": m.get("parent_id", ""),
+            "Es Respuesta": "Sí" if m.get("parent_id") else "No",
+            "Fecha": m.get("fecha", ""),
+            "Eliminado": "Sí" if m.get("eliminado") else "No",
+        })
+
+    df_messages = pd.DataFrame(msg_rows)
+
+    # ── Sheet 5: SUMMARY (resumen de la red) ──
+    non_ghost = [p for p in profiles if not p.get("es_fantasma")]
+    ghost = [p for p in profiles if p.get("es_fantasma")]
+    countries = set(p.get("pais") for p in non_ghost if p.get("pais"))
+
+    # Dimension distribution
+    dim_dist = {}
+    for p in non_ghost:
+        for d in p.get("dimensiones_regeneracion", []):
+            dim_dist[dims_map.get(d, d)] = dim_dist.get(dims_map.get(d, d), 0) + 1
+
+    # Axis distribution
+    axis_dist = {}
+    for p in non_ghost:
+        for a in p.get("acciones", []):
+            prefix = a.rsplit("_", 1)[0] if "_" in a else a
+            # Find axis for this action
+            for ax in get_axes(lang):
+                if any(act["id"] == a for act in ax["actions"]):
+                    axis_dist[ax["name"]] = axis_dist.get(ax["name"], 0) + 1
+                    break
+
+    # Actor type distribution
+    type_dist = {}
+    for p in non_ghost:
+        label = actor_map.get(p.get("tipo_actor", ""), p.get("tipo_actor", ""))
+        type_dist[label] = type_dist.get(label, 0) + 1
+
+    idx_values = [indices.get(p["id"], 0) for p in non_ghost]
+    avg_idx = sum(idx_values) / max(len(idx_values), 1)
+    max_idx = max(idx_values) if idx_values else 0
+    min_idx = min(idx_values) if idx_values else 0
+
+    summary_rows = [
+        {"Métrica": "Total Perfiles (sin fantasmas)", "Valor": len(non_ghost)},
+        {"Métrica": "Nodos Fantasma (externos)", "Valor": len(ghost)},
+        {"Métrica": "Total Conexiones", "Valor": len(connections)},
+        {"Métrica": "Territorios de Impacto", "Valor": len(impact_locs)},
+        {"Métrica": "Países Representados", "Valor": len(countries)},
+        {"Métrica": "Mensajes del Foro", "Valor": len(all_messages)},
+        {"Métrica": "Índice Promedio", "Valor": round(avg_idx, 1)},
+        {"Métrica": "Índice Máximo", "Valor": round(max_idx, 1)},
+        {"Métrica": "Índice Mínimo", "Valor": round(min_idx, 1)},
+        {"Métrica": "---", "Valor": "---"},
+        {"Métrica": "DISTRIBUCIÓN POR DIMENSIÓN", "Valor": ""},
+    ]
+    for k, v in sorted(dim_dist.items(), key=lambda x: x[1], reverse=True):
+        summary_rows.append({"Métrica": f"  {k}", "Valor": v})
+
+    summary_rows.append({"Métrica": "---", "Valor": "---"})
+    summary_rows.append({"Métrica": "DISTRIBUCIÓN POR EJE DE ACCIÓN", "Valor": ""})
+    for k, v in sorted(axis_dist.items(), key=lambda x: x[1], reverse=True):
+        summary_rows.append({"Métrica": f"  {k}", "Valor": v})
+
+    summary_rows.append({"Métrica": "---", "Valor": "---"})
+    summary_rows.append({"Métrica": "DISTRIBUCIÓN POR TIPO DE ACTOR", "Valor": ""})
+    for k, v in sorted(type_dist.items(), key=lambda x: x[1], reverse=True):
+        summary_rows.append({"Métrica": f"  {k}", "Valor": v})
+
+    summary_rows.append({"Métrica": "---", "Valor": "---"})
+    summary_rows.append({"Métrica": "PAÍSES", "Valor": ""})
+    for c in sorted(countries):
+        count = len([p for p in non_ghost if p.get("pais") == c])
+        summary_rows.append({"Métrica": f"  {c}", "Valor": count})
+
+    df_summary = pd.DataFrame(summary_rows)
+
+    # ── Sheet 6: INDEX RANKING ──
+    ranking_rows = []
+    ranked = sorted(non_ghost, key=lambda x: indices.get(x["id"], 0), reverse=True)
+    for i, p in enumerate(ranked, 1):
+        ranking_rows.append({
+            "Ranking": i,
+            "Nombre": p["nombre"],
+            "Tipo Actor": actor_map.get(p.get("tipo_actor", ""), ""),
+            "País": p.get("pais", ""),
+            "Ciudad": p.get("ciudad", ""),
+            "Índice Puentes": indices.get(p["id"], 0),
+            "Nº Conexiones": len([c for c in connections if c["source_profile_id"] == p["id"] or c["target_profile_id"] == p["id"]]),
+            "Nº Acciones": len(p.get("acciones", [])),
+            "Nº Dimensiones": len(p.get("dimensiones_regeneracion", [])),
+            "Nº Redes": len(p.get("redes_participa", [])),
+            "Año Inicio": p.get("ano_inicio_regeneracion", ""),
+        })
+
+    df_ranking = pd.DataFrame(ranking_rows)
+
+    # ── Write to Excel ──
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_summary.to_excel(writer, sheet_name="Resumen Red", index=False)
+        df_ranking.to_excel(writer, sheet_name="Ranking Índice", index=False)
+        df_profiles.to_excel(writer, sheet_name="Perfiles", index=False)
+        df_connections.to_excel(writer, sheet_name="Conexiones", index=False)
+        df_impact.to_excel(writer, sheet_name="Territorios Impacto", index=False)
+        df_messages.to_excel(writer, sheet_name="Foro", index=False)
+
+        # Auto-adjust column widths
+        for sheet_name in writer.sheets:
+            ws = writer.sheets[sheet_name]
+            for col_cells in ws.columns:
+                max_length = 0
+                col_letter = col_cells[0].column_letter
+                for cell in col_cells:
+                    try:
+                        cell_len = len(str(cell.value)) if cell.value else 0
+                        if cell_len > max_length:
+                            max_length = cell_len
+                    except:
+                        pass
+                ws.column_dimensions[col_letter].width = min(max_length + 3, 60)
+
+    output.seek(0)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"puentes_regenerativos_db_{timestamp}.xlsx"
+    return output, filename
+
+
+def _collect_all_messages(db):
+    """Collect all messages (threads + replies) from demo DB."""
+    all_msgs = []
+    threads = db.get_messages(parent_id=None)
+    for t in threads:
+        all_msgs.append(t)
+        replies = db.get_messages(parent_id=t["id"])
+        all_msgs.extend(replies)
+    return all_msgs
